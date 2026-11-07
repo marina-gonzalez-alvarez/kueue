@@ -56,6 +56,12 @@ const (
 	// Node in the manager's centralized TAS cache.
 	MultiKueueClusterLabel = "kueue.x-k8s.io/multikueue-cluster"
 
+	// MultiKueueCentralizedTASAdmissionGate is the AdmissionGatedBy gate the
+	// manager sets on remote workloads it dispatches with centralized TAS, so
+	// the worker never schedules them itself and only runs the admission the
+	// manager stamps onto them.
+	MultiKueueCentralizedTASAdmissionGate = "kueue.x-k8s.io/multikueue-centralized-tas"
+
 	// PodSetLabel is a label set on the Job's PodTemplate to indicate the name
 	// of the PodSet of the admitted Workload corresponding to the PodTemplate.
 	// The label is set when starting the Job, and removed on stopping the Job.

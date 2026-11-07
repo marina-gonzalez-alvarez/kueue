@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +38,7 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/constants"
+	clientutil "sigs.k8s.io/kueue/pkg/util/client"
 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadpatching "sigs.k8s.io/kueue/pkg/workload/patching"
@@ -218,8 +220,10 @@ func (w *wlReconciler) centralizedTASNominate(ctx context.Context, group *wlGrou
 		}
 	}
 
-	// Ensure only the chosen cluster holds a remote workload (create it if needed).
-	if _, err := w.syncToSingleCluster(ctx, log, group, clusterName); err != nil {
+	// Ensure only the chosen cluster holds a remote workload (create it if
+	// needed). The gate stops the worker scheduler from admitting the remote
+	// workload itself before the stamp below lands.
+	if _, err := w.syncToSingleCluster(ctx, log, group, clusterName, constants.MultiKueueCentralizedTASAdmissionGate); err != nil {
 		return reconcile.Result{}, true, err
 	}
 
@@ -243,4 +247,35 @@ func (w *wlReconciler) centralizedTASNominate(ctx context.Context, group *wlGrou
 	}
 	log.V(2).Info("Stamped manager admission onto remote workload", "podSets", len(admission.PodSetAssignments))
 	return reconcile.Result{RequeueAfter: w.workerLostTimeout}, true, nil
+}
+
+func setAdmissionGate(wl *kueue.Workload, gate string) {
+	if wl.Annotations == nil {
+		wl.Annotations = make(map[string]string, 1)
+	}
+	wl.Annotations[constants.AdmissionGatedByAnnotation] = gate
+}
+
+// removeCentralizedTASGate drops the centralized-TAS admission gate from a
+// remote workload the manager never stamped, so the worker can schedule it
+// through normal dispatch. Other gates on the workload are kept.
+func removeCentralizedTASGate(ctx context.Context, remoteCl client.Client, remoteWl *kueue.Workload) error {
+	if workload.HasQuotaReservation(remoteWl) {
+		return nil
+	}
+	gates := strings.Split(remoteWl.Annotations[constants.AdmissionGatedByAnnotation], ",")
+	kept := slices.DeleteFunc(slices.Clone(gates), func(g string) bool {
+		return strings.TrimSpace(g) == constants.MultiKueueCentralizedTASAdmissionGate
+	})
+	if len(kept) == len(gates) {
+		return nil
+	}
+	return clientutil.Patch(ctx, remoteCl, remoteWl, func() (bool, error) {
+		if len(kept) == 0 {
+			delete(remoteWl.Annotations, constants.AdmissionGatedByAnnotation)
+		} else {
+			remoteWl.Annotations[constants.AdmissionGatedByAnnotation] = strings.Join(kept, ",")
+		}
+		return true, nil
+	})
 }

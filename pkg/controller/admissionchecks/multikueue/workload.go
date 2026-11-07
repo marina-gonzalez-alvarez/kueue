@@ -815,13 +815,19 @@ func admittedClusterQueue(wl *kueue.Workload) kueue.ClusterQueueReference {
 	return wl.Status.Admission.ClusterQueue
 }
 
-func (w *wlReconciler) syncToSingleCluster(ctx context.Context, log klog.Logger, group *wlGroup, targetCluster string) (reconcile.Result, error) {
+// syncToSingleCluster ensures only targetCluster holds a remote workload. A
+// non-empty admissionGate is set as the AdmissionGatedBy annotation of a newly
+// created remote workload.
+func (w *wlReconciler) syncToSingleCluster(ctx context.Context, log klog.Logger, group *wlGroup, targetCluster, admissionGate string) (reconcile.Result, error) {
 	var errs []error
 
 	for clusterName, remoteWl := range group.remotes {
 		if clusterName == targetCluster {
 			if remoteWl == nil {
 				clone := cloneForCreate(group.local, group.remoteClients[clusterName].origin, false)
+				if admissionGate != "" {
+					setAdmissionGate(clone, admissionGate)
+				}
 				if err := group.remoteClients[clusterName].getClient().Create(ctx, clone); err != nil {
 					log.V(2).Error(err, "creating remote workload", "cluster", clusterName)
 					errs = append(errs, err)
@@ -898,7 +904,7 @@ func (w *wlReconciler) nominateAndSynchronizeWorkers(ctx context.Context, group 
 					return reconcile.Result{}, err
 				}
 			}
-			return w.syncToSingleCluster(ctx, log, group, assignedWorkerCluster)
+			return w.syncToSingleCluster(ctx, log, group, assignedWorkerCluster, "")
 		}
 		log.V(3).Info("Worker cluster not available", "cluster", assignedWorkerCluster)
 		return reconcile.Result{}, fmt.Errorf("assigned worker cluster %q is not available", assignedWorkerCluster)
@@ -960,6 +966,9 @@ func (w *wlReconciler) nominateAndSynchronizeWorkers(ctx context.Context, group 
 				} else {
 					metrics.ReportMultiKueueWorkloadDispatched(admittedClusterQueue(group.local), rem, w.roleTracker)
 				}
+			} else if err := removeCentralizedTASGate(ctx, group.remoteClients[rem].getClient(), remoteWl); err != nil {
+				log.V(2).Error(err, "removing centralized TAS admission gate", "remote", rem)
+				errs = append(errs, err)
 			}
 		} else if remoteWl != nil {
 			if err := client.IgnoreNotFound(group.RemoveRemoteObjects(ctx, rem)); err != nil {

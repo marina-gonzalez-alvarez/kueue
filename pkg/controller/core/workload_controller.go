@@ -1134,6 +1134,12 @@ func (r *WorkloadReconciler) mayUpdateConditionForAdmissionGatedBy(ctx context.C
 	if !features.Enabled(features.AdmissionGatedBy) {
 		return false, nil
 	}
+	// A MultiKueue manager using centralized TAS stamps its admission onto a
+	// remote workload it created with this gate; the gate must not undo that
+	// reservation.
+	if workload.HasQuotaReservation(wl) && hasCentralizedTASAdmissionGate(wl) {
+		return false, nil
+	}
 
 	hasGatedAnnotation := workload.HasAdmissionGate(wl)
 	hasGatedCondition := hasAdmissionGatedCondition(wl)
@@ -1174,6 +1180,12 @@ func (r *WorkloadReconciler) mayUpdateConditionForAdmissionGatedBy(ctx context.C
 	}
 
 	return false, nil
+}
+
+func hasCentralizedTASAdmissionGate(wl *kueue.Workload) bool {
+	return slices.ContainsFunc(strings.Split(wl.Annotations[constants.AdmissionGatedByAnnotation], ","), func(g string) bool {
+		return strings.TrimSpace(g) == constants.MultiKueueCentralizedTASAdmissionGate
+	})
 }
 
 // hasAdmissionGatedCondition returns true if the workload has a QuotaReserved

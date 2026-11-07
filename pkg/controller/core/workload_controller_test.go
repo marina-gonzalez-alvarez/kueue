@@ -2140,6 +2140,22 @@ func TestReconcile(t *testing.T) {
 			},
 			reconcilerOpts: []Option{},
 		},
+		"workload stamped by a centralized TAS manager keeps its admission despite the gate": {
+			workload: utiltestingapi.MakeWorkload("wl", "ns").
+				Queue("lq").
+				Annotation(constants.AdmissionGatedByAnnotation, constants.MultiKueueCentralizedTASAdmissionGate).
+				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").Obj(), now).
+				AdmittedAt(true, now).
+				Obj(),
+			cq: utiltestingapi.MakeClusterQueue("cq").Obj(),
+			lq: utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj(),
+			wantWorkload: utiltestingapi.MakeWorkload("wl", "ns").
+				Queue("lq").
+				Annotation(constants.AdmissionGatedByAnnotation, constants.MultiKueueCentralizedTASAdmissionGate).
+				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").Obj(), now).
+				AdmittedAt(true, now).
+				Obj(),
+		},
 		"workload without AdmissionGatedBy annotation and no gated condition should not be affected": {
 			workload: utiltestingapi.MakeWorkload("wl", "ns").
 				Queue("lq").
