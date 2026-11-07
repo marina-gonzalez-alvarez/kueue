@@ -23,7 +23,9 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,6 +49,7 @@ var _ = ginkgo.Describe("Centralized TAS", ginkgo.Label("area:multikueue", "feat
 		clusterQueueName = "centralized-tas-cq"
 		localQueueName   = "centralized-tas-lq"
 		flavorName       = "centralized-tas-flavor"
+		legacyFlavorName = "centralized-tas-legacy-flavor"
 		managerTopology  = "centralized-tas-manager"
 		workerTopology   = "centralized-tas-worker"
 		workerNodeName   = "centralized-tas-node"
@@ -67,11 +70,12 @@ var _ = ginkgo.Describe("Centralized TAS", ginkgo.Label("area:multikueue", "feat
 		managerCQ          *kueue.ClusterQueue
 		managerLQ          *kueue.LocalQueue
 
-		workerTopologyObj *kueue.Topology
-		workerFlavor      *kueue.ResourceFlavor
-		workerCQ          *kueue.ClusterQueue
-		workerLQ          *kueue.LocalQueue
-		workerNode        *corev1.Node
+		workerTopologyObj  *kueue.Topology
+		workerFlavor       *kueue.ResourceFlavor
+		workerLegacyFlavor *kueue.ResourceFlavor
+		workerCQ           *kueue.ClusterQueue
+		workerLQ           *kueue.LocalQueue
+		workerNode         *corev1.Node
 	)
 
 	ginkgo.BeforeAll(func() {
@@ -102,6 +106,12 @@ var _ = ginkgo.Describe("Centralized TAS", ginkgo.Label("area:multikueue", "feat
 			TopologyName(workerTopologyObj.Name).
 			Obj()
 		util.MustCreate(worker1TestCluster.ctx, worker1TestCluster.client, workerFlavor)
+		// Same nodes without a topology, listed first on the worker: if the
+		// worker scheduler admitted a copy itself, it would pick this flavor.
+		workerLegacyFlavor = utiltestingapi.MakeResourceFlavor(legacyFlavorName).
+			NodeLabel("node-group", "tas").
+			Obj()
+		util.MustCreate(worker1TestCluster.ctx, worker1TestCluster.client, workerLegacyFlavor)
 		workerNode = testingnode.MakeNode(workerNodeName).
 			Label(corev1.LabelHostname, workerHostname).
 			Label("node-group", "tas").
@@ -113,7 +123,10 @@ var _ = ginkgo.Describe("Centralized TAS", ginkgo.Label("area:multikueue", "feat
 			Obj()
 		util.CreateNodesWithStatus(worker1TestCluster.ctx, worker1TestCluster.client, []corev1.Node{*workerNode})
 		workerCQ = utiltestingapi.MakeClusterQueue(clusterQueueName).
-			ResourceGroup(*utiltestingapi.MakeFlavorQuotas(flavorName).Resource(corev1.ResourceCPU, "100").Obj()).
+			ResourceGroup(
+				*utiltestingapi.MakeFlavorQuotas(legacyFlavorName).Resource(corev1.ResourceCPU, "100").Obj(),
+				*utiltestingapi.MakeFlavorQuotas(flavorName).Resource(corev1.ResourceCPU, "100").Obj(),
+			).
 			Obj()
 		util.CreateClusterQueuesAndWaitForActive(worker1TestCluster.ctx, worker1TestCluster.client, workerCQ)
 		workerLQ = utiltestingapi.MakeLocalQueue(localQueueName, workerNs.Name).ClusterQueue(workerCQ.Name).Obj()
@@ -170,6 +183,7 @@ var _ = ginkgo.Describe("Centralized TAS", ginkgo.Label("area:multikueue", "feat
 		util.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, workerCQ, true)
 		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerFlavor, true)
 		util.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, workerFlavor, true)
+		util.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, workerLegacyFlavor, true)
 		util.ExpectObjectToBeDeleted(managerTestCluster.ctx, managerTestCluster.client, managerTopologyObj, true)
 		util.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, workerTopologyObj, true)
 		util.ExpectObjectToBeDeleted(worker1TestCluster.ctx, worker1TestCluster.client, workerNode, true)
@@ -224,5 +238,51 @@ var _ = ginkgo.Describe("Centralized TAS", ginkgo.Label("area:multikueue", "feat
 				Count:  1,
 			}}))
 		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("admits the worker copy only through the manager's stamp", func() {
+		// An unconstrained topology request lets the worker scheduler fall back
+		// to the legacy flavor listed first, so a worker-side admission would
+		// differ from the manager's.
+		job := testingjob.MakeJob("job", managerNs.Name).
+			ManagedBy(kueue.MultiKueueControllerName).
+			Queue(kueue.LocalQueueName(managerLQ.Name)).
+			PodAnnotation(kueue.PodSetUnconstrainedTopologyAnnotation, "true").
+			Request(corev1.ResourceCPU, "1").
+			Obj()
+		util.MustCreate(managerTestCluster.ctx, managerTestCluster.client, job)
+
+		wlKey := types.NamespacedName{
+			Name:      workloadjob.GetWorkloadNameForJob(job.Name, job.UID),
+			Namespace: job.Namespace,
+		}
+		gomega.Eventually(func(g gomega.Gomega) {
+			workerWl := &kueue.Workload{}
+			g.Expect(worker1TestCluster.client.Get(worker1TestCluster.ctx, wlKey, workerWl)).To(gomega.Succeed())
+			g.Expect(workerWl.Annotations).To(gomega.HaveKeyWithValue(
+				constants.AdmissionGatedByAnnotation, constants.MultiKueueCentralizedTASAdmissionGate))
+			admitted := apimeta.FindStatusCondition(workerWl.Status.Conditions, kueue.WorkloadAdmitted)
+			g.Expect(admitted).NotTo(gomega.BeNil())
+			g.Expect(admitted.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(admitted.Reason).To(gomega.Equal("CentralizedTAS"))
+			g.Expect(workerWl.Status.Admission).NotTo(gomega.BeNil())
+			g.Expect(workerWl.Status.Admission.PodSetAssignments).To(gomega.HaveLen(1))
+			psa := workerWl.Status.Admission.PodSetAssignments[0]
+			g.Expect(psa.Flavors).To(gomega.HaveKeyWithValue(corev1.ResourceCPU, kueue.ResourceFlavorReference(flavorName)))
+			g.Expect(psa.TopologyAssignment).NotTo(gomega.BeNil())
+			g.Expect(utiltas.InternalFrom(psa.TopologyAssignment).Domains).To(gomega.Equal([]utiltas.TopologyDomainAssignment{{
+				Values: []string{workerHostname},
+				Count:  1,
+			}}))
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+
+		ginkgo.By("keeping the stamp after the worker controllers reconcile the gated copy", func() {
+			gomega.Consistently(func(g gomega.Gomega) {
+				workerWl := &kueue.Workload{}
+				g.Expect(worker1TestCluster.client.Get(worker1TestCluster.ctx, wlKey, workerWl)).To(gomega.Succeed())
+				g.Expect(workerWl.Status.Conditions).To(utiltesting.HaveConditionStatusTrue(kueue.WorkloadQuotaReserved))
+				g.Expect(workerWl.Status.Conditions).To(utiltesting.HaveConditionStatusTrue(kueue.WorkloadAdmitted))
+			}, util.ConsistentDuration, util.ShortInterval).Should(gomega.Succeed())
+		})
 	})
 })
