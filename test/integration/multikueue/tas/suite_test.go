@@ -117,7 +117,7 @@ func managerSetup(ctx context.Context, mgr manager.Manager) {
 	setupManager(ctx, mgr)
 }
 
-func setupManager(ctx context.Context, mgr manager.Manager) (*jobframework.IntegrationManager, *schdcache.Cache) {
+func setupManager(ctx context.Context, mgr manager.Manager) (*jobframework.IntegrationManager, *schdcache.Cache, *qcache.Manager) {
 	integrationManager := jobframework.NewIntegrationManager()
 	gomega.Expect(workloadjob.RegisterIntegration(integrationManager)).To(gomega.Succeed())
 	err := indexer.Setup(ctx, mgr.GetFieldIndexer())
@@ -191,7 +191,7 @@ func setupManager(ctx context.Context, mgr manager.Manager) (*jobframework.Integ
 	err = sched.Start(ctx)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-	return integrationManager, cCache
+	return integrationManager, cCache, queues
 }
 
 func managerAndMultiKueueSetup(
@@ -201,7 +201,7 @@ func managerAndMultiKueueSetup(
 	enabledIntegrations sets.Set[string],
 	dispatcherName string,
 ) {
-	integrationManager, cCache := setupManager(ctx, mgr)
+	integrationManager, cCache, queues := setupManager(ctx, mgr)
 
 	err := multikueue.SetupIndexer(ctx, mgr.GetFieldIndexer(), managersConfigNamespace.Name)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -216,6 +216,7 @@ func managerAndMultiKueueSetup(
 		multikueue.WithAdapters(adapters),
 		multikueue.WithDispatcherName(dispatcherName),
 		multikueue.WithSchedulerCache(cCache),
+		multikueue.WithQueueManager(queues),
 	)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 }

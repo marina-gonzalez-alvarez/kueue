@@ -27,17 +27,21 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/constants"
+	"sigs.k8s.io/kueue/pkg/controller/tas"
 	clientutil "sigs.k8s.io/kueue/pkg/util/client"
 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/workload"
@@ -51,7 +55,16 @@ func (rc *remoteClient) startTASInventoryWatchers(ctx context.Context) error {
 	tasCache := rc.schedulerCache.TASCache()
 	log := ctrl.LoggerFrom(ctx).WithValues("clusterName", rc.clusterName)
 
-	syncNode := func(obj any) {
+	rc.tasInventoryMu.Lock()
+	if rc.tasRetryCh == nil {
+		rc.tasRetryCh = make(chan struct{}, 1)
+	}
+	rc.tasInventoryMu.Unlock()
+	if rc.queues != nil {
+		rc.runWatcher(func() { rc.runTASRetryNotifier(ctx) })
+	}
+
+	syncNode := func(obj any, capacityMayHaveFreed bool) {
 		node, ok := obj.(*corev1.Node)
 		if !ok {
 			return
@@ -65,12 +78,19 @@ func (rc *remoteClient) startTASInventoryWatchers(ctx context.Context) error {
 		nodeCopy.Labels[constants.MultiKueueClusterLabel] = rc.clusterName
 		rc.updateTASInventory(ctx, func() {
 			tasCache.SyncNode(nodeCopy)
+			if capacityMayHaveFreed {
+				rc.requestTASRetry()
+			}
 		})
 	}
 
 	if _, err := rc.client.AddCacheEventHandler(ctx, &corev1.Node{}, toolscache.ResourceEventHandlerFuncs{
-		AddFunc:    syncNode,
-		UpdateFunc: func(_, newObj any) { syncNode(newObj) },
+		AddFunc: func(obj any) { syncNode(obj, true) },
+		UpdateFunc: func(oldObj, newObj any) {
+			oldNode, oldOK := oldObj.(*corev1.Node)
+			newNode, newOK := newObj.(*corev1.Node)
+			syncNode(newObj, !oldOK || !newOK || tas.NodeSchedulingPropertiesChanged(newNode, oldNode))
+		},
 		DeleteFunc: func(obj any) {
 			if node, err := deletedObjectState[*corev1.Node](obj); err == nil {
 				rc.updateTASInventory(ctx, func() {
@@ -88,10 +108,14 @@ func (rc *remoteClient) startTASInventoryWatchers(ctx context.Context) error {
 			return
 		}
 		rc.updateTASInventory(ctx, func() {
+			var freed utiltas.NodeKey
 			if schdcache.BelongsToNonTASCache(pod) {
-				tasCache.UpdateNonTASUsageWithCluster(rc.clusterName, pod, log)
+				freed = tasCache.UpdateNonTASUsageWithCluster(rc.clusterName, pod, log)
 			} else {
-				tasCache.DeleteNonTASUsageByKeyWithCluster(rc.clusterName, podKey(pod), log)
+				freed = tasCache.DeleteNonTASUsageByKeyWithCluster(rc.clusterName, podKey(pod), log)
+			}
+			if freed.Name != "" {
+				rc.requestTASRetry()
 			}
 		})
 	}
@@ -102,7 +126,9 @@ func (rc *remoteClient) startTASInventoryWatchers(ctx context.Context) error {
 		DeleteFunc: func(obj any) {
 			if pod, err := deletedObjectState[*corev1.Pod](obj); err == nil {
 				rc.updateTASInventory(ctx, func() {
-					tasCache.DeleteNonTASUsageByKeyWithCluster(rc.clusterName, podKey(pod), log)
+					if freed := tasCache.DeleteNonTASUsageByKeyWithCluster(rc.clusterName, podKey(pod), log); freed.Name != "" {
+						rc.requestTASRetry()
+					}
 				})
 			}
 		},
@@ -120,6 +146,42 @@ func (rc *remoteClient) updateTASInventory(ctx context.Context, update func()) {
 	// StopWatchers cancels this context before clearing the worker partition.
 	if ctx.Err() == nil {
 		update()
+	}
+}
+
+// requestTASRetry asks for inadmissible workloads to be retried because remote
+// capacity may have freed up. Requests are coalesced; it never blocks.
+func (rc *remoteClient) requestTASRetry() {
+	select {
+	case rc.tasRetryCh <- struct{}{}:
+	default:
+	}
+}
+
+// runTASRetryNotifier retries inadmissible workloads in every ClusterQueue
+// using a TAS flavor, at most once per batch period. Local Node and Pod
+// changes trigger the same retry through the TAS controllers.
+func (rc *remoteClient) runTASRetryNotifier(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-rc.tasRetryCh:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(constants.UpdatesBatchPeriod):
+		}
+		cqNames := sets.New[kueue.ClusterQueueReference]()
+		for flavor := range rc.schedulerCache.CloneTASCache() {
+			cqNames.Insert(rc.schedulerCache.ClusterQueuesUsingFlavor(flavor)...)
+		}
+		if cqNames.Len() > 0 {
+			ctrl.LoggerFrom(ctx).V(3).Info("Retrying inadmissible workloads after remote capacity changed",
+				"clusterName", rc.clusterName, "clusterQueues", sets.List(cqNames))
+			qcache.NotifyRetryInadmissible(rc.queues, cqNames)
+		}
 	}
 }
 

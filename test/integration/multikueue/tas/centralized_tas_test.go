@@ -240,6 +240,54 @@ var _ = ginkgo.Describe("Centralized TAS", ginkgo.Label("area:multikueue", "feat
 		}, util.Timeout, util.Interval).Should(gomega.Succeed())
 	})
 
+	ginkgo.It("retries a waiting workload when a worker node starts to fit it", func() {
+		const zoneLabel, zone = "example.com/zone", "zone-a"
+		job := testingjob.MakeJob("job", managerNs.Name).
+			ManagedBy(kueue.MultiKueueControllerName).
+			Queue(kueue.LocalQueueName(managerLQ.Name)).
+			PodAnnotation(kueue.PodSetRequiredTopologyAnnotation, corev1.LabelHostname).
+			NodeSelector(zoneLabel, zone).
+			Request(corev1.ResourceCPU, "1").
+			Obj()
+		util.MustCreate(managerTestCluster.ctx, managerTestCluster.client, job)
+
+		wlKey := types.NamespacedName{
+			Name:      workloadjob.GetWorkloadNameForJob(job.Name, job.UID),
+			Namespace: job.Namespace,
+		}
+		ginkgo.By("waiting while no worker node matches the node selector", func() {
+			gomega.Eventually(func(g gomega.Gomega) {
+				managerWl := &kueue.Workload{}
+				g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, wlKey, managerWl)).To(gomega.Succeed())
+				g.Expect(managerWl.Status.Conditions).To(utiltesting.HaveConditionStatusFalse(kueue.WorkloadQuotaReserved))
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		})
+
+		ginkgo.By("labelling the worker node so it fits", func() {
+			gomega.Eventually(func(g gomega.Gomega) {
+				node := &corev1.Node{}
+				g.Expect(worker1TestCluster.client.Get(worker1TestCluster.ctx, client.ObjectKeyFromObject(workerNode), node)).To(gomega.Succeed())
+				node.Labels[zoneLabel] = zone
+				g.Expect(worker1TestCluster.client.Update(worker1TestCluster.ctx, node)).To(gomega.Succeed())
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		})
+
+		ginkgo.By("admitting the workload on that node without any other event", func() {
+			gomega.Eventually(func(g gomega.Gomega) {
+				managerWl := &kueue.Workload{}
+				g.Expect(managerTestCluster.client.Get(managerTestCluster.ctx, wlKey, managerWl)).To(gomega.Succeed())
+				g.Expect(managerWl.Status.Admission).NotTo(gomega.BeNil())
+				g.Expect(managerWl.Status.Admission.PodSetAssignments).To(gomega.HaveLen(1))
+				topologyAssignment := managerWl.Status.Admission.PodSetAssignments[0].TopologyAssignment
+				g.Expect(topologyAssignment).NotTo(gomega.BeNil())
+				g.Expect(utiltas.InternalFrom(topologyAssignment).Domains).To(gomega.Equal([]utiltas.TopologyDomainAssignment{{
+					Values: []string{workerCluster.Name, workerHostname},
+					Count:  1,
+				}}))
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		})
+	})
+
 	ginkgo.It("admits the worker copy only through the manager's stamp", func() {
 		// An unconstrained topology request lets the worker scheduler fall back
 		// to the legacy flavor listed first, so a worker-side admission would

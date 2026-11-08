@@ -236,6 +236,12 @@ func checkNodeSchedulingPropertiesChanged(newNode, oldNode *corev1.Node) eventTy
 	return et
 }
 
+// NodeSchedulingPropertiesChanged reports whether a Node update can change
+// which workloads fit on the Node.
+func NodeSchedulingPropertiesChanged(newNode, oldNode *corev1.Node) bool {
+	return checkNodeSchedulingPropertiesChanged(newNode, oldNode) != nodeUnchanged
+}
+
 func extractNodeAllocatableChange(newNode, oldNode *corev1.Node) eventType {
 	if equality.Semantic.DeepEqual(oldNode.Status.Allocatable, newNode.Status.Allocatable) {
 		return nodeUnchanged

@@ -55,6 +55,104 @@ func (c *inventoryEventClient) AddCacheEventHandler(_ context.Context, obj clien
 	return nil, nil
 }
 
+func TestTASInventoryRequestsRetryWhenCapacityMayFree(t *testing.T) {
+	node := testingnode.MakeNode("node").Label(corev1.LabelHostname, "host").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("5"), corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready().Obj()
+	pod := testingpod.MakePod("pod", "ns").NodeName(node.Name).
+		Request(corev1.ResourceCPU, "1").StatusPhase(corev1.PodRunning).Obj()
+	cases := map[string]struct {
+		action    func(*inventoryEventClient)
+		wantRetry bool
+	}{
+		"node added": {
+			action:    func(events *inventoryEventClient) { events.nodes.OnAdd(node, false) },
+			wantRetry: true,
+		},
+		"node uncordoned": {
+			action: func(events *inventoryEventClient) {
+				cordoned := node.DeepCopy()
+				cordoned.Spec.Unschedulable = true
+				events.nodes.OnUpdate(cordoned, node)
+			},
+			wantRetry: true,
+		},
+		"node allocatable grows": {
+			action: func(events *inventoryEventClient) {
+				grown := node.DeepCopy()
+				grown.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("8")
+				events.nodes.OnUpdate(node, grown)
+			},
+			wantRetry: true,
+		},
+		"node update without scheduling change": {
+			action: func(events *inventoryEventClient) {
+				heartbeat := node.DeepCopy()
+				heartbeat.ResourceVersion = "2"
+				events.nodes.OnUpdate(node, heartbeat)
+			},
+		},
+		"node deleted": {
+			action: func(events *inventoryEventClient) { events.nodes.OnDelete(node) },
+		},
+		"non-TAS pod added": {
+			action: func(events *inventoryEventClient) {
+				other := pod.DeepCopy()
+				other.Name = "other"
+				events.pods.OnAdd(other, false)
+			},
+		},
+		"non-TAS pod deleted": {
+			action: func(events *inventoryEventClient) {
+				events.pods.OnDelete(toolscache.DeletedFinalStateUnknown{Obj: pod})
+			},
+			wantRetry: true,
+		},
+		"non-TAS pod finished": {
+			action: func(events *inventoryEventClient) {
+				terminal := pod.DeepCopy()
+				terminal.Status.Phase = corev1.PodSucceeded
+				events.pods.OnUpdate(pod, terminal)
+			},
+			wantRetry: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
+			ctx, _ := utiltesting.ContextWithLog(t)
+			watchCtx, cancel := context.WithCancel(ctx)
+			t.Cleanup(cancel)
+			events := &inventoryEventClient{}
+			rc := &remoteClient{clusterName: "worker1", client: events, schedulerCache: schdcache.New(utiltesting.NewFakeClient())}
+			rc.setWatchCancel(cancel)
+			t.Cleanup(rc.StopWatchers)
+			if err := rc.startTASInventoryWatchers(watchCtx); err != nil {
+				t.Fatal(err)
+			}
+			events.nodes.OnAdd(node, true)
+			events.pods.OnAdd(pod, true)
+			select {
+			case <-rc.tasRetryCh:
+			default:
+			}
+
+			tc.action(events)
+
+			gotRetry := false
+			select {
+			case <-rc.tasRetryCh:
+				gotRetry = true
+			default:
+			}
+			if gotRetry != tc.wantRetry {
+				t.Errorf("retry requested = %v, want %v", gotRetry, tc.wantRetry)
+			}
+		})
+	}
+}
+
 func TestTASInventoryClusterIsolation(t *testing.T) {
 	cases := map[string]struct {
 		action func(*testing.T, context.Context, *remoteClient, *inventoryEventClient, *corev1.Node, *corev1.Pod)

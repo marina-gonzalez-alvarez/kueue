@@ -67,6 +67,7 @@ import (
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
@@ -182,6 +183,11 @@ type remoteClient struct {
 	schedulerCache    *schdcache.Cache
 	watchEstablishing atomic.Bool
 	tasInventoryMu    sync.Mutex
+	// queues is the manager's queue manager, used to retry inadmissible
+	// workloads when remote capacity frees up. Nil when centralized TAS is off.
+	queues *qcache.Manager
+	// tasRetryCh coalesces requests to retry inadmissible workloads.
+	tasRetryCh chan struct{}
 
 	connState connectionState
 
@@ -863,6 +869,7 @@ type clustersReconciler struct {
 	// schedulerCache is the manager's scheduler cache, threaded to each
 	// remoteClient for centralized TAS. Nil when the feature is off.
 	schedulerCache *schdcache.Cache
+	queues         *qcache.Manager
 }
 
 type clusterProfileAccessProvider interface {
@@ -919,6 +926,7 @@ func (c *clustersReconciler) findOrCreateRemoteClient(clusterName, origin string
 	client, found := c.remoteClients[clusterName]
 	if !found {
 		client = newRemoteClient(c.localClient, c.wlUpdateCh, c.watchEndedCh, c.cqUpdateCh, origin, clusterName, c.adapters, c.schedulerCache)
+		client.queues = c.queues
 		if c.builderOverride != nil {
 			client.builderOverride = c.builderOverride
 		}
@@ -1305,6 +1313,7 @@ type clustersReconcilerOptions struct {
 	recorder                     events.EventRecorder
 	clientConnection             *configapi.ClientConnection
 	schedulerCache               *schdcache.Cache
+	queues                       *qcache.Manager
 }
 
 type clustersReconcilerOption func(*clustersReconcilerOptions)
@@ -1363,6 +1372,12 @@ func withSchedulerCache(schedulerCache *schdcache.Cache) clustersReconcilerOptio
 	}
 }
 
+func withQueueManager(queues *qcache.Manager) clustersReconcilerOption {
+	return func(o *clustersReconcilerOptions) {
+		o.queues = queues
+	}
+}
+
 func newClustersReconciler(
 	c client.Client,
 	namespace string,
@@ -1395,6 +1410,7 @@ func newClustersReconciler(
 		roleTracker:                  options.roleTracker,
 		clientConnection:             options.clientConnection,
 		schedulerCache:               options.schedulerCache,
+		queues:                       options.queues,
 	}
 }
 

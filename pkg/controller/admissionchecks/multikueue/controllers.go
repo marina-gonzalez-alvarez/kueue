@@ -23,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
+	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
@@ -48,6 +49,7 @@ type SetupOptions struct {
 	roleTracker          *roletracker.RoleTracker
 	clientConnection     *configapi.ClientConnection
 	schedulerCache       *schdcache.Cache
+	queues               *qcache.Manager
 }
 
 type SetupOption func(o *SetupOptions)
@@ -126,6 +128,15 @@ func WithSchedulerCache(c *schdcache.Cache) SetupOption {
 	}
 }
 
+// WithQueueManager provides the manager's queue manager so centralized TAS can
+// retry inadmissible workloads when remote worker capacity frees up. It is a
+// no-op unless centralized TAS is enabled.
+func WithQueueManager(q *qcache.Manager) SetupOption {
+	return func(o *SetupOptions) {
+		o.queues = q
+	}
+}
+
 func SetupControllers(mgr ctrl.Manager, namespace string, opts ...SetupOption) error {
 	options := &SetupOptions{
 		gcInterval:        defaultGCInterval,
@@ -182,6 +193,7 @@ func SetupControllers(mgr ctrl.Manager, namespace string, opts ...SetupOption) e
 		withEventRecorder(mgr.GetEventRecorder("multikueue-cluster")),
 		withClientConnection(options.clientConnection),
 		withSchedulerCache(options.schedulerCache),
+		withQueueManager(options.queues),
 	)
 	err = cRec.setupWithManager(mgr)
 	if err != nil {
